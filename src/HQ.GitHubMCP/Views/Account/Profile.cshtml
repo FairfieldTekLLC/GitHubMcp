@@ -1,0 +1,33 @@
+@model AppUser
+@{
+    ViewData["Title"] = "Registration";
+}
+
+<h1>Your registration</h1>
+
+<dl>
+    <dt>Name</dt>
+    <dd>@Model.DisplayName</dd>
+
+    <dt>Email</dt>
+    <dd>@Model.Email</dd>
+
+    <dt>HQ role</dt>
+    <dd>@Model.Role</dd>
+
+    <dt>GitHub</dt>
+    <dd>@(Model.GitHubIdentity?.Login ?? "Not connected")</dd>
+</dl>
+
+@if (Model.GitHubIdentity is null)
+{
+    <a class="button" asp-action="ConnectGitHub">Connect GitHub Enterprise Cloud</a>
+}
+else
+{
+    <div>
+        <a class="button" asp-action="ConnectGitHub">Reconnect GitHub Enterprise Cloud</a>
+        <a class="button" asp-action="CompleteGitHubSsoAuthorization">Complete GitHub SSO Authorization</a>
+    </div>
+    <p class="ok">Registration complete. Repository access still requires an administrator grant and matching GitHub permission.</p>
+}

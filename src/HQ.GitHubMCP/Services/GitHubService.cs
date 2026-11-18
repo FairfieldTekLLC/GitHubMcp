@@ -1,0 +1,1277 @@
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using GitHubMCP.Data;
+using GitHubMCP.Models;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.EntityFrameworkCore;
+
+namespace GitHubMCP.Services;
+
+/// <summary>
+/// Provides GitHub user OAuth, GitHub App installation authentication,
+/// repository permission validation, commits, and pull-request operations.
+/// </summary>
+public sealed class GitHubService(
+    HttpClient http,
+    IConfiguration cfg,
+    IDataProtectionProvider dp,
+    IWebHostEnvironment env,
+    AppDbContext db,
+    ILogger<GitHubService> logger)
+{
+    private readonly IDataProtector protector =
+        dp.CreateProtector("GitHubMCP.GitHubToken.v1");
+
+    private readonly SemaphoreSlim appTokenLock = new(1, 1);
+
+    private string? appInstallationToken;
+    private DateTimeOffset appInstallationTokenExpiresUtc;
+    private string? appInstallationContentsPermission;
+    private string? appInstallationAdministrationPermission;
+
+    private string AuthenticationMode =>
+        cfg["GitHub:AuthenticationMode"] ?? "OAuth";
+
+    public bool IsGitHubAppMode =>
+        AuthenticationMode.Equals(
+            "GitHubApp",
+            StringComparison.OrdinalIgnoreCase);
+
+    private string ApiBaseUrl =>
+        cfg["GitHub:ApiBaseUrl"]
+        ?? throw new InvalidOperationException(
+            "GitHub:ApiBaseUrl is not configured.");
+
+    private string WebBaseUrl =>
+        cfg["GitHub:WebBaseUrl"]
+        ?? throw new InvalidOperationException(
+            "GitHub:WebBaseUrl is not configured.");
+
+    public string Protect(string token)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        return protector.Protect(token);
+    }
+
+    public string Unprotect(string token)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        return protector.Unprotect(token);
+    }
+
+    /// <summary>
+    /// Creates a request using the credential appropriate for repository
+    /// mutation execution. GitHubApp mode uses an installation token.
+    /// OAuth mode uses the connected employee's user token.
+    /// </summary>
+    private async Task<HttpRequestMessage> CreateExecutionRequestAsync(
+        AppUser user,
+        HttpMethod method,
+        string path,
+        CancellationToken ct,
+        object? body = null)
+    {
+        string token;
+
+        if (AuthenticationMode.Equals(
+                "GitHubApp",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            token = await GetInstallationAccessTokenAsync(ct);
+        }
+        else
+        {
+            token = await GetUserAccessTokenAsync(user, ct);
+        }
+
+        logger.LogInformation(
+            "GitHub execution request prepared: Method={Method}, Path={Path}, AuthMode={AuthMode}",
+            method.Method,
+            path,
+            AuthenticationMode);
+
+        return BuildRequest(token, method, path, body);
+    }
+
+    /// <summary>
+    /// Creates a request that always represents the connected GitHub user.
+    /// Use this for effective-permission validation.
+    /// </summary>
+    private async Task<HttpRequestMessage> CreateUserRequestAsync(
+        AppUser user,
+        HttpMethod method,
+        string path,
+        CancellationToken ct,
+        object? body = null)
+    {
+        var token = await GetUserAccessTokenAsync(user, ct);
+        return BuildRequest(token, method, path, body);
+    }
+
+    /// <summary>
+    /// Ensures the user access token is current, refreshing when needed.
+    /// </summary>
+    public async Task EnsureUserAccessTokenAsync(AppUser user, CancellationToken ct)
+    {
+        _ = await GetUserAccessTokenAsync(user, ct);
+    }
+
+    /// <summary>
+    /// Sends an authorized GitHub API request using the execution credential
+    /// (installation token in GitHubApp mode, user token in OAuth mode) and
+    /// returns the HTTP status plus parsed JSON body when available.
+    /// </summary>
+    /// <param name="user">The acting application user.</param>
+    /// <param name="method">The HTTP method.</param>
+    /// <param name="path">The GitHub API relative path.</param>
+    /// <param name="body">An optional JSON request body.</param>
+    /// <param name="ct">A token used to cancel the operation.</param>
+    /// <returns>The status code and parsed JSON document text.</returns>
+    public async Task<GitHubApiResult> SendApiAsync(
+        AppUser user,
+        HttpMethod method,
+        string path,
+        object? body,
+        CancellationToken ct)
+    {
+        using var request = await CreateExecutionRequestAsync(
+            user,
+            method,
+            path,
+            ct,
+            body);
+
+        using var response = await http.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        var responseBody = await response.Content.ReadAsStringAsync(ct);
+
+        logger.LogInformation(
+            "GitHub API call: Method={Method}, Path={Path}, HTTP={Status}, RequestId={RequestId}",
+            method.Method,
+            path,
+            (int)response.StatusCode,
+            GetGitHubRequestId(response));
+
+        return new GitHubApiResult(
+            (int)response.StatusCode,
+            response.IsSuccessStatusCode,
+            responseBody);
+    }
+
+    private async Task<string> GetUserAccessTokenAsync(
+        AppUser user,
+        CancellationToken ct)
+    {
+        var identity = user.GitHubIdentity;
+
+        if (identity is null ||
+            string.IsNullOrWhiteSpace(identity.ProtectedAccessToken))
+        {
+            throw new UnauthorizedAccessException(
+                "The user has not connected a GitHub account.");
+        }
+
+        if (identity.AccessTokenExpiresUtc is DateTimeOffset accessExpiryUtc &&
+            accessExpiryUtc <= DateTimeOffset.UtcNow.AddMinutes(1))
+        {
+            logger.LogInformation(
+                "GitHub user access token is near expiry; attempting refresh. UserId={UserId}, ExpiresUtc={ExpiresUtc}",
+                user.Id,
+                accessExpiryUtc);
+
+            await RefreshUserAccessTokenAsync(user, ct);
+        }
+
+        if (string.IsNullOrWhiteSpace(identity.ProtectedAccessToken))
+        {
+            throw new UnauthorizedAccessException(
+                "The connected GitHub account does not have a usable access token.");
+        }
+
+        return Unprotect(identity.ProtectedAccessToken);
+    }
+
+    private HttpRequestMessage BuildRequest(
+        string token,
+        HttpMethod method,
+        string path,
+        object? body = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+
+        var request = new HttpRequestMessage(
+            method,
+            new Uri(new Uri(ApiBaseUrl), path));
+
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", token);
+
+        request.Headers.UserAgent.ParseAdd(
+            "HQ.GitHubMCP/1.0");
+
+        request.Headers.Accept.Add(
+            new MediaTypeWithQualityHeaderValue(
+                "application/vnd.github+json"));
+
+        request.Headers.Add(
+            "X-GitHub-Api-Version",
+            "2022-11-28");
+
+        if (body is not null)
+        {
+            request.Content = JsonContent.Create(body);
+        }
+
+        return request;
+    }
+
+    /// <summary>
+    /// Exchanges a GitHub App user-authorization code for a user access
+    /// token and retrieves the authenticated GitHub identity.
+    ///
+    /// This must remain available when AuthenticationMode is GitHubApp.
+    /// GitHub Apps support both installation tokens and user access tokens.
+    /// </summary>
+    public async Task<GitHubOAuthExchangeResult>
+        ExchangeCodeAsync(
+            string code,
+            CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(code);
+
+        var clientId = cfg["GitHub:ClientId"];
+        var clientSecret = cfg["GitHub:ClientSecret"];
+        var callbackUrl = cfg["GitHub:CallbackUrl"];
+
+        if (string.IsNullOrWhiteSpace(clientId))
+        {
+            throw new InvalidOperationException(
+                "GitHub:ClientId is not configured.");
+        }
+
+        if (string.IsNullOrWhiteSpace(clientSecret))
+        {
+            throw new InvalidOperationException(
+                "GitHub:ClientSecret is not configured.");
+        }
+
+        if (string.IsNullOrWhiteSpace(callbackUrl))
+        {
+            throw new InvalidOperationException(
+                "GitHub:CallbackUrl is not configured.");
+        }
+
+        var tokenEndpoint = new Uri(
+            new Uri(WebBaseUrl),
+            "login/oauth/access_token");
+
+        using var tokenRequest = new HttpRequestMessage(
+            HttpMethod.Post,
+            tokenEndpoint)
+        {
+            Content = JsonContent.Create(new
+            {
+                client_id = clientId,
+                client_secret = clientSecret,
+                code,
+                redirect_uri = callbackUrl
+            })
+        };
+
+        tokenRequest.Headers.Accept.Add(
+            new MediaTypeWithQualityHeaderValue(
+                "application/json"));
+
+        using var tokenResponse = await http.SendAsync(
+            tokenRequest,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        logger.LogInformation(
+            "GitHub OAuth code exchange response: HTTP={Status}, RequestId={RequestId}",
+            (int)tokenResponse.StatusCode,
+            GetGitHubRequestId(tokenResponse));
+
+        var tokenResponseBody =
+            await tokenResponse.Content.ReadAsStringAsync(ct);
+
+        if (!tokenResponse.IsSuccessStatusCode)
+        {
+            logger.LogWarning(
+                "GitHub OAuth token exchange failed with HTTP {StatusCode}.",
+                (int)tokenResponse.StatusCode);
+
+            throw new InvalidOperationException(
+                $"GitHub OAuth token exchange failed with HTTP " +
+                $"{(int)tokenResponse.StatusCode}.");
+        }
+
+        using var tokenDocument =
+            JsonDocument.Parse(tokenResponseBody);
+
+        var tokenJson = tokenDocument.RootElement;
+
+        logger.LogInformation(
+            "GitHub OAuth token response: HasAccessToken={HasAccessToken}, HasRefreshToken={HasRefreshToken}, HasAccessExpiration={HasAccessExpiration}, HasRefreshExpiration={HasRefreshExpiration}",
+            tokenJson.TryGetProperty("access_token", out _),
+            tokenJson.TryGetProperty("refresh_token", out _),
+            tokenJson.TryGetProperty("expires_in", out _),
+            tokenJson.TryGetProperty("refresh_token_expires_in", out _));
+
+        if (tokenJson.TryGetProperty(
+                "error",
+                out var errorElement))
+        {
+            var errorCode =
+                errorElement.GetString() ?? "unknown_error";
+
+            logger.LogWarning(
+                "GitHub OAuth returned error {ErrorCode}.",
+                errorCode);
+
+            throw new InvalidOperationException(
+                $"GitHub OAuth error: {errorCode}");
+        }
+
+        if (!tokenJson.TryGetProperty(
+                "access_token",
+                out var tokenElement) ||
+            string.IsNullOrWhiteSpace(tokenElement.GetString()))
+        {
+            throw new InvalidOperationException(
+                "GitHub OAuth response did not contain an access token.");
+        }
+
+        var accessToken = tokenElement.GetString()!;
+
+        var accessTokenExpiresUtc =
+            tokenJson.TryGetProperty("expires_in", out var expiresInElement) &&
+            expiresInElement.TryGetInt32(out var expiresInSeconds)
+                ? DateTimeOffset.UtcNow.AddSeconds(expiresInSeconds)
+                : (DateTimeOffset?)null;
+
+        var refreshToken =
+            tokenJson.TryGetProperty("refresh_token", out var refreshElement)
+                ? refreshElement.GetString()
+                : null;
+
+        var refreshTokenExpiresUtc =
+            tokenJson.TryGetProperty(
+                "refresh_token_expires_in",
+                out var refreshExpiresInElement) &&
+            refreshExpiresInElement.TryGetInt32(out var refreshExpiresInSeconds)
+                ? DateTimeOffset.UtcNow.AddSeconds(refreshExpiresInSeconds)
+                : (DateTimeOffset?)null;
+
+        using var profileRequest = new HttpRequestMessage(
+            HttpMethod.Get,
+            new Uri(new Uri(ApiBaseUrl), "user"));
+
+        profileRequest.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        profileRequest.Headers.UserAgent.ParseAdd(
+            "HQ.GitHubMCP/1.0");
+
+        profileRequest.Headers.Accept.Add(
+            new MediaTypeWithQualityHeaderValue(
+                "application/vnd.github+json"));
+
+        profileRequest.Headers.Add(
+            "X-GitHub-Api-Version",
+            "2022-11-28");
+
+        using var profileResponse = await http.SendAsync(
+            profileRequest,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        logger.LogInformation(
+            "GitHub user profile response: HTTP={Status}, RequestId={RequestId}",
+            (int)profileResponse.StatusCode,
+            GetGitHubRequestId(profileResponse));
+
+        profileResponse.EnsureSuccessStatusCode();
+
+        var profile = await profileResponse.Content
+            .ReadFromJsonAsync<JsonElement>(ct);
+
+        if (profile.ValueKind != JsonValueKind.Object ||
+            !profile.TryGetProperty("id", out var idElement) ||
+            !profile.TryGetProperty("login", out var loginElement) ||
+            string.IsNullOrWhiteSpace(loginElement.GetString()))
+        {
+            throw new InvalidOperationException(
+                "GitHub OAuth user profile response was missing required fields.");
+        }
+
+        return new GitHubOAuthExchangeResult(
+            idElement.GetInt64(),
+            loginElement.GetString()!,
+            accessToken,
+            accessTokenExpiresUtc,
+            refreshToken,
+            refreshTokenExpiresUtc);
+    }
+
+    /// <summary>
+    /// Validates whether the employee's own GitHub user token grants the
+    /// required permission on the target repository.
+    /// </summary>
+    public async Task<bool> HasGitHubPermissionAsync(
+     AppUser user,
+     GitHubRepository repository,
+     RepositoryPermission needed,
+     CancellationToken ct)
+    {
+        using var request = await CreateUserRequestAsync(
+            user,
+            HttpMethod.Get,
+            $"repos/{Uri.EscapeDataString(repository.Owner)}/" +
+            $"{Uri.EscapeDataString(repository.Name)}",
+            ct);
+
+        using var response = await http.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        var responseBody = await response.Content.ReadAsStringAsync(ct);
+
+        string? githubMessage = null;
+
+        try
+        {
+            using var document1 = JsonDocument.Parse(responseBody);
+
+            if (document1.RootElement.TryGetProperty(
+                    "message", out var message))
+            {
+                githubMessage = message.GetString();
+            }
+        }
+        catch (JsonException)
+        {
+            githubMessage = "Non-JSON response";
+        }
+
+        logger.LogWarning(
+            "GitHub permission check: HTTP={Status}, Repository={Owner}/{Name}, Message={Message}, RequestId={RequestId}",
+            (int)response.StatusCode,
+            repository.Owner,
+            repository.Name,
+            githubMessage,
+            response.Headers.TryGetValues(
+                "X-GitHub-Request-Id", out var ids)
+                ? ids.FirstOrDefault()
+                : "unknown");
+
+        var body = responseBody;
+
+        logger.LogInformation(
+            "GitHub permission check for {Owner}/{Repository}: " +
+            "Required={RequiredPermission}, HTTP={StatusCode}",
+            repository.Owner,
+            repository.Name,
+            needed,
+            (int)response.StatusCode);
+
+        if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            throw new UnauthorizedAccessException(
+                "The connected GitHub authorization has expired or was revoked. " +
+                "Reconnect the GitHub account.");
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+        {
+            if (IsSamlSsoAuthorizationRequired(response, githubMessage))
+            {
+                var samlOrganization =
+                    cfg["GitHub:Organization"] ?? "B-F-Saul-Company";
+
+                throw new UnauthorizedAccessException(
+                    "GitHub SAML SSO authorization required.\n\n" +
+                    "Your GitHub account has connected successfully, " +
+                    "but the OAuth token is not authorized for " +
+                    $"{samlOrganization}.\n\n" +
+                    "Complete GitHub SSO authorization and retry.");
+            }
+
+            throw new UnauthorizedAccessException(
+                "GitHub accepted the user token but denied repository access.");
+        }
+
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            throw new UnauthorizedAccessException(
+                "GitHub did not expose this repository to the connected user token. " +
+                "Verify the GitHub App installation and repository selection.");
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            logger.LogWarning(
+                "Unexpected GitHub permission response. HTTP={StatusCode}",
+                (int)response.StatusCode);
+
+            return false;
+        }
+
+        using var document = JsonDocument.Parse(body);
+        var root = document.RootElement;
+
+        if (!root.TryGetProperty("permissions", out var permissions))
+        {
+            logger.LogWarning(
+                "GitHub repository response for {Owner}/{Repository} " +
+                "did not contain permissions.",
+                repository.Owner,
+                repository.Name);
+
+            return false;
+        }
+
+        var permissionProperty = needed switch
+        {
+            RepositoryPermission.Read => "pull",
+            RepositoryPermission.Write => "push",
+            RepositoryPermission.Admin => "admin",
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(needed),
+                needed,
+                "Unsupported repository permission.")
+        };
+
+        return permissions.TryGetProperty(
+                   permissionProperty,
+                   out var granted) &&
+               granted.ValueKind == JsonValueKind.True;
+    }
+
+    public async Task<bool> HasInstallationPermissionAsync(
+        GitHubRepository repository,
+        RepositoryPermission needed,
+        CancellationToken ct)
+    {
+        var token = await GetInstallationAccessTokenAsync(ct);
+
+        using var request = BuildRequest(
+            token,
+            HttpMethod.Get,
+            $"repos/{Uri.EscapeDataString(repository.Owner)}/{Uri.EscapeDataString(repository.Name)}");
+
+        using var response = await http.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        var responseBody = await response.Content.ReadAsStringAsync(ct);
+
+        string? githubMessage = null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(responseBody);
+
+            if (document.RootElement.TryGetProperty(
+                    "message",
+                    out var messageElement))
+            {
+                githubMessage = messageElement.GetString();
+            }
+        }
+        catch (JsonException)
+        {
+            githubMessage = "Non-JSON response";
+        }
+
+        logger.LogWarning(
+            "GitHub installation permission check: HTTP={Status}, Repository={Owner}/{Name}, Needed={Needed}, Message={Message}, RequestId={RequestId}",
+            (int)response.StatusCode,
+            repository.Owner,
+            repository.Name,
+            needed,
+            githubMessage,
+            GetGitHubRequestId(response));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return false;
+        }
+
+        // The successful repository request confirms that the
+        // GitHub App installation can access this repository.
+        //
+        // Authorization is based on the installation token's
+        // granted permissions, not user-oriented repository flags.
+        return HasRequiredInstallationTokenPermission(needed);
+    }
+
+    private async Task RefreshUserAccessTokenAsync(
+        AppUser user,
+        CancellationToken ct)
+    {
+        var identity = user.GitHubIdentity;
+
+        if (identity is null)
+        {
+            throw new UnauthorizedAccessException(
+                "The user has not connected a GitHub account.");
+        }
+
+        if (string.IsNullOrWhiteSpace(identity.ProtectedRefreshToken))
+        {
+            throw new UnauthorizedAccessException(
+                "The connected GitHub authorization cannot be refreshed. Reconnect GitHub.");
+        }
+
+        if (identity.RefreshTokenExpiresUtc is DateTimeOffset refreshExpiryUtc &&
+            refreshExpiryUtc <= DateTimeOffset.UtcNow.AddMinutes(1))
+        {
+            throw new UnauthorizedAccessException(
+                "The connected GitHub refresh token has expired. Reconnect GitHub.");
+        }
+
+        var refreshToken = Unprotect(identity.ProtectedRefreshToken);
+
+        var clientId = cfg["GitHub:ClientId"];
+        var clientSecret = cfg["GitHub:ClientSecret"];
+
+        if (string.IsNullOrWhiteSpace(clientId) ||
+            string.IsNullOrWhiteSpace(clientSecret))
+        {
+            throw new InvalidOperationException(
+                "GitHub OAuth client credentials are not configured.");
+        }
+
+        var tokenEndpoint = new Uri(
+            new Uri(WebBaseUrl),
+            "login/oauth/access_token");
+
+        using var refreshRequest = new HttpRequestMessage(
+            HttpMethod.Post,
+            tokenEndpoint)
+        {
+            Content = JsonContent.Create(new
+            {
+                client_id = clientId,
+                client_secret = clientSecret,
+                grant_type = "refresh_token",
+                refresh_token = refreshToken
+            })
+        };
+
+        refreshRequest.Headers.Accept.Add(
+            new MediaTypeWithQualityHeaderValue("application/json"));
+
+        using var refreshResponse = await http.SendAsync(
+            refreshRequest,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        logger.LogInformation(
+            "GitHub OAuth refresh response: HTTP={Status}, RequestId={RequestId}",
+            (int)refreshResponse.StatusCode,
+            GetGitHubRequestId(refreshResponse));
+
+        var refreshBody = await refreshResponse.Content.ReadAsStringAsync(ct);
+
+        if (!refreshResponse.IsSuccessStatusCode)
+        {
+            logger.LogWarning(
+                "GitHub OAuth refresh failed with HTTP {StatusCode}.",
+                (int)refreshResponse.StatusCode);
+
+            throw new UnauthorizedAccessException(
+                "GitHub authorization refresh failed. Reconnect GitHub account.");
+        }
+
+        using var refreshDocument = JsonDocument.Parse(refreshBody);
+        var refreshJson = refreshDocument.RootElement;
+
+        if (refreshJson.TryGetProperty("error", out var errorElement))
+        {
+            var errorCode = errorElement.GetString() ?? "unknown_error";
+
+            logger.LogWarning(
+                "GitHub OAuth refresh returned error {ErrorCode}.",
+                errorCode);
+
+            throw new UnauthorizedAccessException(
+                "GitHub authorization refresh failed. Reconnect GitHub account.");
+        }
+
+        if (!refreshJson.TryGetProperty("access_token", out var accessTokenElement) ||
+            string.IsNullOrWhiteSpace(accessTokenElement.GetString()))
+        {
+            throw new UnauthorizedAccessException(
+                "GitHub refresh response did not contain an access token.");
+        }
+
+        var accessToken = accessTokenElement.GetString()!;
+
+        var accessTokenExpiresUtc =
+            refreshJson.TryGetProperty("expires_in", out var expiresInElement) &&
+            expiresInElement.TryGetInt32(out var expiresInSeconds)
+                ? DateTimeOffset.UtcNow.AddSeconds(expiresInSeconds)
+                : identity.AccessTokenExpiresUtc;
+
+        var newRefreshToken =
+            refreshJson.TryGetProperty("refresh_token", out var refreshTokenElement)
+                ? refreshTokenElement.GetString()
+                : refreshToken;
+
+        var refreshTokenExpiresUtc =
+            refreshJson.TryGetProperty("refresh_token_expires_in", out var refreshExpiresElement) &&
+            refreshExpiresElement.TryGetInt32(out var refreshExpiresSeconds)
+                ? DateTimeOffset.UtcNow.AddSeconds(refreshExpiresSeconds)
+                : identity.RefreshTokenExpiresUtc;
+
+        identity.ProtectedAccessToken = Protect(accessToken);
+        identity.AccessTokenExpiresUtc = accessTokenExpiresUtc;
+
+        if (!string.IsNullOrWhiteSpace(newRefreshToken))
+        {
+            identity.ProtectedRefreshToken = Protect(newRefreshToken);
+        }
+
+        identity.RefreshTokenExpiresUtc = refreshTokenExpiresUtc;
+        identity.ConnectedUtc = DateTimeOffset.UtcNow;
+
+        if (db.Entry(identity).State == EntityState.Detached)
+        {
+            db.Attach(identity);
+            db.Entry(identity).State = EntityState.Modified;
+        }
+
+        await db.SaveChangesAsync(ct);
+
+        logger.LogInformation(
+            "GitHub OAuth refresh succeeded for user {UserId}. AccessExpiryUtc={AccessExpiryUtc}, RefreshExpiryUtc={RefreshExpiryUtc}",
+            user.Id,
+            identity.AccessTokenExpiresUtc,
+            identity.RefreshTokenExpiresUtc);
+    }
+
+    /// <summary>
+    /// Applies one or more file changes and returns the final content URL.
+    /// </summary>
+    public async Task<string> CreateCommitAsync(
+        AppUser user,
+        GitHubRepository repository,
+        CommitPayload payload,
+        CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(payload.Branch);
+
+        await EnsureBranchExistsAsync(
+            user,
+            repository,
+            payload.Branch,
+            repository.DefaultBranch,
+            ct);
+
+        logger.LogInformation(
+            "GitHub commit operation started: Repository={Owner}/{Name}, Branch={Branch}, FileCount={FileCount}",
+            repository.Owner,
+            repository.Name,
+            payload.Branch,
+            payload.Files.Count);
+
+        var lastUrl = string.Empty;
+
+        foreach (var file in payload.Files)
+        {
+            object commitBody = string.IsNullOrWhiteSpace(file.ExpectedSha)
+                ? new
+                {
+                    message = payload.Message,
+                    content = Convert.ToBase64String(Encoding.UTF8.GetBytes(file.Content)),
+                    branch = payload.Branch
+                }
+                : new
+                {
+                    message = payload.Message,
+                    content = Convert.ToBase64String(Encoding.UTF8.GetBytes(file.Content)),
+                    branch = payload.Branch,
+                    sha = file.ExpectedSha
+                };
+
+            using var request = await CreateExecutionRequestAsync(
+                user,
+                HttpMethod.Put,
+                $"repos/{repository.Owner}/{repository.Name}/contents/{Uri.EscapeDataString(file.Path).Replace("%2F", "/")}",
+                ct,
+                commitBody);
+
+            using var response = await http.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                ct);
+
+            logger.LogInformation(
+                "GitHub commit file response: HTTP={Status}, Repository={Owner}/{Name}, Path={Path}, RequestId={RequestId}",
+                (int)response.StatusCode,
+                repository.Owner,
+                repository.Name,
+                file.Path,
+                GetGitHubRequestId(response));
+
+            response.EnsureSuccessStatusCode();
+
+            var json = await response.Content
+                .ReadFromJsonAsync<JsonElement>(ct);
+
+            lastUrl = json.GetProperty("content")
+                .GetProperty("html_url")
+                .GetString() ?? string.Empty;
+        }
+
+        logger.LogInformation(
+            "GitHub commit operation completed: Repository={Owner}/{Name}, Branch={Branch}, LastUrl={LastUrl}",
+            repository.Owner,
+            repository.Name,
+            payload.Branch,
+            lastUrl);
+
+        return lastUrl;
+    }
+
+    private async Task EnsureBranchExistsAsync(
+        AppUser user,
+        GitHubRepository repository,
+        string targetBranch,
+        string fallbackBaseBranch,
+        CancellationToken ct)
+    {
+        if (string.Equals(
+                targetBranch,
+                fallbackBaseBranch,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            logger.LogInformation(
+                "GitHub branch ensure skipped; target matches base. Repository={Owner}/{Name}, Branch={Branch}",
+                repository.Owner,
+                repository.Name,
+                targetBranch);
+
+            return;
+        }
+
+        var escapedOwner = Uri.EscapeDataString(repository.Owner);
+        var escapedRepo = Uri.EscapeDataString(repository.Name);
+        var escapedTargetBranch = Uri.EscapeDataString(targetBranch);
+
+        using (var branchLookup = await CreateExecutionRequestAsync(
+                   user,
+                   HttpMethod.Get,
+                   $"repos/{escapedOwner}/{escapedRepo}/git/ref/heads/{escapedTargetBranch}",
+                   ct))
+        {
+            using var existingBranchResponse = await http.SendAsync(
+                branchLookup,
+                HttpCompletionOption.ResponseHeadersRead,
+                ct);
+
+            logger.LogInformation(
+                "GitHub branch lookup response: HTTP={Status}, Repository={Owner}/{Name}, Branch={Branch}, RequestId={RequestId}",
+                (int)existingBranchResponse.StatusCode,
+                repository.Owner,
+                repository.Name,
+                targetBranch,
+                GetGitHubRequestId(existingBranchResponse));
+
+            if (existingBranchResponse.IsSuccessStatusCode)
+            {
+                return;
+            }
+
+            if (existingBranchResponse.StatusCode !=
+                System.Net.HttpStatusCode.NotFound)
+            {
+                existingBranchResponse.EnsureSuccessStatusCode();
+            }
+        }
+
+        var escapedBaseBranch = Uri.EscapeDataString(fallbackBaseBranch);
+
+        string baseSha;
+
+        using (var baseLookup = await CreateExecutionRequestAsync(
+                   user,
+                   HttpMethod.Get,
+                   $"repos/{escapedOwner}/{escapedRepo}/git/ref/heads/{escapedBaseBranch}",
+                   ct))
+        {
+            using var baseBranchResponse = await http.SendAsync(
+                baseLookup,
+                HttpCompletionOption.ResponseHeadersRead,
+                ct);
+
+            logger.LogInformation(
+                "GitHub base branch lookup response: HTTP={Status}, Repository={Owner}/{Name}, BaseBranch={BaseBranch}, RequestId={RequestId}",
+                (int)baseBranchResponse.StatusCode,
+                repository.Owner,
+                repository.Name,
+                fallbackBaseBranch,
+                GetGitHubRequestId(baseBranchResponse));
+
+            baseBranchResponse.EnsureSuccessStatusCode();
+
+            var baseRef = await baseBranchResponse.Content
+                .ReadFromJsonAsync<JsonElement>(ct);
+
+            baseSha = baseRef.GetProperty("object")
+                .GetProperty("sha")
+                .GetString()
+                ?? throw new InvalidOperationException(
+                    "GitHub base branch reference did not contain an object sha.");
+        }
+
+        using var createBranchRequest = await CreateExecutionRequestAsync(
+            user,
+            HttpMethod.Post,
+            $"repos/{escapedOwner}/{escapedRepo}/git/refs",
+            ct,
+            new
+            {
+                @ref = $"refs/heads/{targetBranch}",
+                sha = baseSha
+            });
+
+        using var createBranchResponse = await http.SendAsync(
+            createBranchRequest,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        logger.LogInformation(
+            "GitHub create-branch response: HTTP={Status}, Repository={Owner}/{Name}, Branch={Branch}, RequestId={RequestId}",
+            (int)createBranchResponse.StatusCode,
+            repository.Owner,
+            repository.Name,
+            targetBranch,
+            GetGitHubRequestId(createBranchResponse));
+
+        if (createBranchResponse.StatusCode ==
+            System.Net.HttpStatusCode.UnprocessableEntity)
+        {
+            // Branch may have been created concurrently.
+            return;
+        }
+
+        createBranchResponse.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// Creates a pull request and returns the resulting URL.
+    /// </summary>
+    public async Task<string> CreatePullRequestAsync(
+        AppUser user,
+        GitHubRepository repository,
+        PullRequestPayload payload,
+        CancellationToken ct)
+    {
+        using var request = await CreateExecutionRequestAsync(
+            user,
+            HttpMethod.Post,
+            $"repos/{repository.Owner}/{repository.Name}/pulls",
+            ct,
+            new
+            {
+                title = payload.Title,
+                head = payload.Head,
+                @base = payload.Base,
+                body = payload.Body
+            });
+
+        using var response = await http.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
+
+        logger.LogInformation(
+            "GitHub pull request response: HTTP={Status}, Repository={Owner}/{Name}, Head={Head}, Base={Base}, RequestId={RequestId}",
+            (int)response.StatusCode,
+            repository.Owner,
+            repository.Name,
+            payload.Head,
+            payload.Base,
+            GetGitHubRequestId(response));
+
+        response.EnsureSuccessStatusCode();
+
+        var json = await response.Content
+            .ReadFromJsonAsync<JsonElement>(ct);
+
+        var resultUrl = json.GetProperty("html_url").GetString()!;
+
+        logger.LogInformation(
+            "GitHub pull request created: Repository={Owner}/{Name}, Url={Url}",
+            repository.Owner,
+            repository.Name,
+            resultUrl);
+
+        return resultUrl;
+    }
+
+    /// <summary>
+    /// Gets or refreshes an installation token for GitHub App operations.
+    /// </summary>
+    private async Task<string> GetInstallationAccessTokenAsync(
+        CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(appInstallationToken) &&
+            appInstallationTokenExpiresUtc > DateTimeOffset.UtcNow.AddMinutes(1))
+        {
+            logger.LogInformation(
+                "Using cached GitHub installation token. ExpiresUtc={ExpiresUtc}",
+                appInstallationTokenExpiresUtc);
+
+            return appInstallationToken;
+        }
+
+        await appTokenLock.WaitAsync(ct);
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(appInstallationToken) &&
+                appInstallationTokenExpiresUtc > DateTimeOffset.UtcNow.AddMinutes(1))
+            {
+                logger.LogInformation(
+                    "Using cached GitHub installation token after lock. ExpiresUtc={ExpiresUtc}",
+                    appInstallationTokenExpiresUtc);
+
+                return appInstallationToken;
+            }
+
+            var appJwt = CreateGitHubAppJwt();
+            var installationId = cfg["GitHub:InstallationId"]
+                ?? throw new InvalidOperationException(
+                    "GitHub:InstallationId is required for GitHubApp mode.");
+
+            using var request = new HttpRequestMessage(
+                HttpMethod.Post,
+                new Uri(
+                    new Uri(ApiBaseUrl),
+                    $"app/installations/{installationId}/access_tokens"));
+
+            request.Headers.Authorization =
+                new AuthenticationHeaderValue("Bearer", appJwt);
+
+            request.Headers.UserAgent.ParseAdd(
+                "HQ.GitHubMCP/1.0");
+
+            request.Headers.Accept.Add(
+                new MediaTypeWithQualityHeaderValue(
+                    "application/vnd.github+json"));
+
+            request.Headers.Add(
+                "X-GitHub-Api-Version",
+                "2022-11-28");
+
+            using var response = await http.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                ct);
+
+            logger.LogInformation(
+                "GitHub installation token response: HTTP={Status}, InstallationId={InstallationId}, RequestId={RequestId}",
+                (int)response.StatusCode,
+                installationId,
+                GetGitHubRequestId(response));
+
+            response.EnsureSuccessStatusCode();
+
+            var payload = await response.Content
+                .ReadFromJsonAsync<JsonElement>(ct);
+
+            appInstallationToken = payload.GetProperty("token").GetString()
+                ?? throw new InvalidOperationException(
+                    "GitHub installation token response did not contain token.");
+
+            appInstallationTokenExpiresUtc =
+                payload.GetProperty("expires_at")
+                    .GetDateTimeOffset();
+
+            appInstallationContentsPermission = null;
+            appInstallationAdministrationPermission = null;
+
+            if (payload.TryGetProperty("permissions", out var permissions))
+            {
+                if (permissions.TryGetProperty("contents", out var contents))
+                {
+                    appInstallationContentsPermission =
+                        contents.GetString();
+                }
+
+                if (permissions.TryGetProperty("administration", out var administration))
+                {
+                    appInstallationAdministrationPermission =
+                        administration.GetString();
+                }
+            }
+
+            logger.LogInformation(
+                "GitHub installation token permissions: Contents={ContentsPermission}, Administration={AdministrationPermission}",
+                appInstallationContentsPermission ?? "(none)",
+                appInstallationAdministrationPermission ?? "(none)");
+
+            return appInstallationToken;
+        }
+        finally
+        {
+            appTokenLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Creates a signed GitHub App JWT from the configured PEM private key.
+    /// </summary>
+    private string CreateGitHubAppJwt()
+    {
+        var appId = cfg["GitHub:AppId"]
+            ?? throw new InvalidOperationException(
+                "GitHub:AppId is required for GitHubApp mode.");
+
+        var keyPathSetting = cfg["GitHub:PrivateKeyPath"]
+            ?? throw new InvalidOperationException(
+                "GitHub:PrivateKeyPath is required for GitHubApp mode.");
+
+        var keyPath = Path.IsPathRooted(keyPathSetting)
+            ? keyPathSetting
+            : Path.Combine(env.ContentRootPath, keyPathSetting);
+
+        var pem = File.ReadAllText(keyPath);
+
+        using var rsa = RSA.Create();
+        rsa.ImportFromPem(pem);
+
+        var now = DateTimeOffset.UtcNow;
+
+        var header = Base64UrlEncode(
+            JsonSerializer.SerializeToUtf8Bytes(
+                new
+                {
+                    alg = "RS256",
+                    typ = "JWT"
+                }));
+
+        var payload = Base64UrlEncode(
+            JsonSerializer.SerializeToUtf8Bytes(
+                new
+                {
+                    iat = now.AddSeconds(-60).ToUnixTimeSeconds(),
+                    exp = now.AddMinutes(9).ToUnixTimeSeconds(),
+                    iss = appId
+                }));
+
+        var signingInput = $"{header}.{payload}";
+
+        var signature = rsa.SignData(
+            Encoding.ASCII.GetBytes(signingInput),
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+
+        return $"{signingInput}.{Base64UrlEncode(signature)}";
+    }
+
+    private static string GetGitHubRequestId(HttpResponseMessage response) =>
+        response.Headers.TryGetValues("X-GitHub-Request-Id", out var ids)
+            ? ids.FirstOrDefault() ?? "unknown"
+            : "unknown";
+
+    private bool HasRequiredInstallationTokenPermission(
+        RepositoryPermission needed)
+    {
+        return needed switch
+        {
+            RepositoryPermission.Read =>
+                string.Equals(appInstallationContentsPermission, "read", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(appInstallationContentsPermission, "write", StringComparison.OrdinalIgnoreCase),
+
+            RepositoryPermission.Write =>
+                string.Equals(appInstallationContentsPermission, "write", StringComparison.OrdinalIgnoreCase),
+
+            RepositoryPermission.Admin =>
+                IsInstallationAdminEnabled() &&
+                string.Equals(appInstallationAdministrationPermission, "write", StringComparison.OrdinalIgnoreCase),
+
+            _ => false
+        };
+    }
+
+    private static bool? TryGetRepositoryPermissionFromResponse(
+        string responseBody,
+        RepositoryPermission needed)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(responseBody);
+
+            if (!document.RootElement.TryGetProperty("permissions", out var permissions) ||
+                permissions.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            return needed switch
+            {
+                RepositoryPermission.Read =>
+                    permissions.TryGetProperty("pull", out var pull) && pull.ValueKind == JsonValueKind.True,
+
+                RepositoryPermission.Write =>
+                    (permissions.TryGetProperty("push", out var push) && push.ValueKind == JsonValueKind.True) ||
+                    (permissions.TryGetProperty("admin", out var writeAdmin) && writeAdmin.ValueKind == JsonValueKind.True),
+
+                RepositoryPermission.Admin =>
+                    permissions.TryGetProperty("admin", out var admin) && admin.ValueKind == JsonValueKind.True,
+
+                _ => false
+            };
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private bool IsInstallationAdminEnabled() =>
+        bool.TryParse(
+            cfg["GitHub:AllowInstallationAdminOperations"],
+            out var enabled) && enabled;
+
+    private static bool IsSamlSsoAuthorizationRequired(
+        HttpResponseMessage response,
+        string? githubMessage)
+    {
+        var hasSsoRequiredHeader =
+            response.Headers.TryGetValues("X-GitHub-SSO", out var ssoHeaders) &&
+            ssoHeaders.Any(value =>
+                value.Contains("required", StringComparison.OrdinalIgnoreCase));
+
+        var hasSamlMessage =
+            !string.IsNullOrWhiteSpace(githubMessage) &&
+            (githubMessage.Contains("saml", StringComparison.OrdinalIgnoreCase) ||
+             githubMessage.Contains("sso", StringComparison.OrdinalIgnoreCase));
+
+        return hasSsoRequiredHeader || hasSamlMessage;
+    }
+
+    /// <summary>
+    /// Encodes bytes as unpadded base64url.
+    /// </summary>
+    private static string Base64UrlEncode(byte[] bytes) =>
+        Convert.ToBase64String(bytes)
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+}
+     

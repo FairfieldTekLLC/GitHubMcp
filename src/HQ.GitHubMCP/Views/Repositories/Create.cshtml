@@ -1,0 +1,19 @@
+@model RepositoryViewModel
+
+<h1>Register repository</h1>
+
+<form method="post">
+    @Html.AntiForgeryToken()
+    <div asp-validation-summary="All"></div>
+
+    <label asp-for="Owner"></label>
+    <input asp-for="Owner" />
+
+    <label asp-for="Name"></label>
+    <input asp-for="Name" />
+
+    <label asp-for="DefaultBranch"></label>
+    <input asp-for="DefaultBranch" />
+
+    <button type="submit">Register</button>
+</form>

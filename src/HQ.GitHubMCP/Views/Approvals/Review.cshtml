@@ -1,0 +1,37 @@
+@model ApprovalRequest
+
+<h1>Explicit approval required</h1>
+
+<div class="warning">
+    Review carefully. Approval is single-use, expires at @Model.ExpiresUtc, and is bound to this exact payload hash.
+</div>
+
+<dl>
+    <dt>Operation</dt>
+    <dd>@Model.Operation</dd>
+
+    <dt>Repository</dt>
+    <dd>@Model.Repository.Owner/@Model.Repository.Name</dd>
+
+    <dt>Source</dt>
+    <dd>@Model.SourceBranch</dd>
+
+    <dt>Target</dt>
+    <dd>@Model.TargetBranch</dd>
+
+    <dt>Title</dt>
+    <dd>@Model.Title</dd>
+
+    <dt>SHA-256</dt>
+    <dd><code>@Model.PayloadSha256</code></dd>
+</dl>
+
+<h2>Exact payload</h2>
+<pre>@Model.PayloadJson</pre>
+
+<form asp-action="Decide" method="post">
+    @Html.AntiForgeryToken()
+    <input type="hidden" name="id" value="@Model.Id" />
+    <button type="submit" name="approve" value="true">Approve</button>
+    <button type="submit" class="danger" name="approve" value="false">Reject</button>
+</form>

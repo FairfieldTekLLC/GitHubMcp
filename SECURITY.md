@@ -1,0 +1,2 @@
+# Security
+Report vulnerabilities through the organization's private security process. Never commit GitHub client secrets, SQL credentials, access tokens, certificates, or Data Protection keys. All GitHub writes require an authenticated, operation-specific approval and a separate execution request.

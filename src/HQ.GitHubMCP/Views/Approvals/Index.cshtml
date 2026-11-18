@@ -1,0 +1,73 @@
+@using Microsoft.AspNetCore.Authorization
+@model IEnumerable<ApprovalRequest>
+@inject IAuthorizationService AuthorizationService
+
+@{
+    var canAdmin = (await AuthorizationService
+        .AuthorizeAsync(User, "Administrator")).Succeeded;
+}
+
+<h1>Approval requests</h1>
+
+<table>
+    <thead>
+        <tr>
+            <th>Operation</th>
+            <th>Repository</th>
+            <th>Title</th>
+            <th>Status</th>
+            <th>Expires</th>
+            <th>Action</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var r in Model)
+        {
+            <tr>
+                <td>@r.Operation</td>
+                <td>@r.Repository.Owner/@r.Repository.Name</td>
+                <td>@r.Title</td>
+                <td>@r.Status</td>
+                <td>@r.ExpiresUtc</td>
+                <td>
+                    @{
+                        var canReview = canAdmin &&
+                                        r.Status == ApprovalStatus.Pending &&
+                                        r.ExpiresUtc > DateTimeOffset.UtcNow;
+
+                        var canExecute = r.Status == ApprovalStatus.Approved;
+                    }
+
+                    @if (canReview)
+                    {
+                        <a asp-controller="Approvals"
+                           asp-action="Review"
+                           asp-route-id="@r.Id"
+                           class="btn btn-primary">
+                            Review
+                        </a>
+                    }
+                    else
+                    {
+                        <a class="btn btn-primary disabled"
+                           aria-disabled="true"
+                           tabindex="-1">
+                            Review
+                        </a>
+                    }
+
+                    <form asp-action="Execute" method="post" style="display:inline-block">
+                        @Html.AntiForgeryToken()
+                        <input type="hidden" name="id" value="@r.Id" />
+                        <button type="submit" disabled="@(!canExecute)">Execute approved operation</button>
+                    </form>
+
+                    @if (!string.IsNullOrWhiteSpace(r.ResultUrl))
+                    {
+                        <a href="@r.ResultUrl">Result</a>
+                    }
+                </td>
+            </tr>
+        }
+    </tbody>
+</table>

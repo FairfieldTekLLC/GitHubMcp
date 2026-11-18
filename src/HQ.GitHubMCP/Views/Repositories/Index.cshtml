@@ -1,0 +1,27 @@
+@model IEnumerable<GitHubRepository>
+
+<h1>Registered repositories</h1>
+
+<a class="button" asp-action="Create">Register repository</a>
+
+<table>
+    <thead>
+        <tr>
+            <th>Owner</th>
+            <th>Name</th>
+            <th>Default branch</th>
+            <th>Enabled</th>
+        </tr>
+    </thead>
+    <tbody>
+        @foreach (var r in Model)
+        {
+            <tr>
+                <td>@r.Owner</td>
+                <td>@r.Name</td>
+                <td>@r.DefaultBranch</td>
+                <td>@r.IsEnabled</td>
+            </tr>
+        }
+    </tbody>
+</table>
